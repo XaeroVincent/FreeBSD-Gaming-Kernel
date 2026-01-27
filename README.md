@@ -3,4 +3,7 @@
 * **Hidraw ioctl handler** - to improve game controller support **(Currently Incomplete)**
 * **Ignore EPOLLEXCLUSIVE** - to workaround games that require it such as Dota 2 and Counter-Strike 2
 
-More patches may be added later
+These patches were created primarily by: **[Alex S (shkhln)](https://github.com/shkhln)**
+
+Used FreeBSD Source Code:
+https://github.com/freebsd/freebsd-src/tree/release/15.0.0-p1
