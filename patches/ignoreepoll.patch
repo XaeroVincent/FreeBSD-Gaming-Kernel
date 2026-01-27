@@ -1,0 +1,41 @@
+Index: sys/compat/linux/linux_event.h
+===================================================================
+--- sys/compat/linux/linux_event.h
++++ sys/compat/linux/linux_event.h
+@@ -38,9 +38,10 @@
+ #define	LINUX_EPOLLERR		0x008
+ #define	LINUX_EPOLLHUP		0x010
+ #define	LINUX_EPOLLRDHUP	0x2000
+-#define	LINUX_EPOLLWAKEUP	1u<<29
+-#define	LINUX_EPOLLONESHOT	1u<<30
+-#define	LINUX_EPOLLET		1u<<31
++#define	LINUX_EPOLLEXCLUSIVE	(1u << 28)
++#define	LINUX_EPOLLWAKEUP	(1u << 29)
++#define	LINUX_EPOLLONESHOT	(1u << 30)
++#define	LINUX_EPOLLET		(1u << 31)
+ 
+ #define	LINUX_EPOLL_EVRD	(LINUX_EPOLLIN|LINUX_EPOLLRDNORM)
+ #define	LINUX_EPOLL_EVWR	(LINUX_EPOLLOUT|LINUX_EPOLLWRNORM)
+Index: sys/compat/linux/linux_event.c
+===================================================================
+--- sys/compat/linux/linux_event.c
++++ sys/compat/linux/linux_event.c
+@@ -177,6 +177,18 @@
+ 		++(*nkevents);
+ 	}
+ 
++	/*
++	 * XXX Linux epoll_ctl documents EPOLLEXCLUSIVE's behaviour as "one or
++	 * more of the epoll file descriptors will receive an event."  Just
++	 * ignore EPOLLEXCLUSIVE as a naive but perhaps conforming
++	 * implementation.
++	 */
++        if (levents & LINUX_EPOLLEXCLUSIVE) {
++		LINUX_CTR1(linux_epollexclusive,
++		    "thread(%d) ignoring EPOLLEXCLUSIVE", td->td_tid);
++		levents &= ~LINUX_EPOLLEXCLUSIVE;
++	}
++
+ 	if ((levents & ~(LINUX_EPOLL_EVSUP)) != 0) {
+ 		p = td->td_proc;
+ 

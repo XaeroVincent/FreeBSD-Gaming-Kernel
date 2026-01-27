@@ -1,0 +1,12 @@
+diff -ruN --show-c-function sys/compat/linsysfs/linsysfs.c sys/compat/linsysfs/linsysfs.c
+--- sys/compat/linsysfs/linsysfs.c	2026-01-26 04:28:57.264464000 -0800
++++ sys/compat/linsysfs/linsysfs.c	2026-01-26 16:29:33.003746000 -0800
+@@ -374,7 +374,7 @@ linsysfs_run_bus(device_t dev, struct pfs_node *dir, s
+ 			name = devclass_get_name(devclass);
+ 		else
+ 			name = NULL;
+-		if (name != NULL && strcmp(name, DRMN_DEV) == 0 &&
++                if (name != NULL && (strcmp(name, DRMN_DEV) == 0 || device_get_unit(dev) >= 128) &&
+ 		    device_get_unit(dev) >= 0) {
+ 			dinfo = device_get_ivars(parent);
+ 			if (dinfo != NULL && dinfo->cfg.baseclass == PCIC_DISPLAY) {

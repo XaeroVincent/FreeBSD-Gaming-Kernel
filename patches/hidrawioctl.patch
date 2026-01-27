@@ -1,0 +1,117 @@
+From 7eee9d713476270445b2110566702706c807b4c6 Mon Sep 17 00:00:00 2001
+From: Alex S <iwtcex@gmail.com>
+Date: Wed, 31 Dec 2025 12:11:53 +0300
+Subject: [PATCH] linux: add hidraw ioctl handler
+
+Signed-off-by: Alex S <iwtcex@gmail.com>
+---
+ sys/compat/linux/linux_ioctl.c | 51 ++++++++++++++++++++++++++++++++++
+ sys/compat/linux/linux_ioctl.h | 19 +++++++++++++
+ 2 files changed, 70 insertions(+)
+
+diff --git sys/compat/linux/linux_ioctl.c sys/compat/linux/linux_ioctl.c
+index ceb17bd040b551..cb4893d041a1e7 100644
+--- sys/compat/linux/linux_ioctl.c
++++ sys/compat/linux/linux_ioctl.c
+@@ -58,6 +58,7 @@
+ #include <net/if_types.h>
+ 
+ #include <dev/evdev/input.h>
++#include <dev/hid/hidraw.h>
+ #include <dev/ususb_ioctl.h>
+ 
+ #ifdef COMPAT_LINUX32
+@@ -113,6 +114,7 @@ DEFINE_LINUX_IOCTL_SET(kcov, KCOV);
+ #ifndef COMPAT_LINUX32
+ DEFINE_LINUX_IOCTL_SET(nvme, NVME);
+ #endif
++DEFINE_LINUX_IOCTL_SET(hidraw, HIDRAW);
+ 
+ #undef DEFINE_LINUX_IOCTL_SET
+ 
+@@ -3570,6 +3572,55 @@ linux_ioctl_nvme(struct thread *td, struct linux_ioctl_args *args)
+ }
+ #endif
+ 
++static int
++linux_ioctl_hidraw(struct thread *td, struct linux_ioctl_args *args)
++{
++	int len = (args->cmd & 0x3fff0000) >> 16;
++	if (len > 8192)
++		return (EINVAL);
++
++	switch (args->cmd & 0xffff) {
++	case LINUX_HIDIOCGRDESCSIZE:
++		args->cmd = HIDIOCGRDESCSIZE;
++		break;
++	case LINUX_HIDIOCGRDESC:
++		args->cmd = HIDIOCGRDESC;
++		break;
++	case LINUX_HIDIOCGRAWINFO:
++		args->cmd = HIDIOCGRAWINFO;
++		break;
++	case LINUX_HIDIOCGRAWNAME:
++		args->cmd = HIDIOCGRAWNAME(len);
++		break;
++	case LINUX_HIDIOCGRAWPHYS:
++		args->cmd = HIDIOCGRAWPHYS(len);
++		break;
++	case LINUX_HIDIOCSFEATURE:
++		args->cmd = HIDIOCSFEATURE(len);
++		break;
++	case LINUX_HIDIOCGFEATURE:
++		args->cmd = HIDIOCGFEATURE(len);
++		break;
++	case LINUX_HIDIOCGRAWUNIQ:
++		args->cmd = HIDIOCGRAWUNIQ(len);
++		break;
++	case LINUX_HIDIOCSINPUT:
++		args->cmd = HIDIOCSINPUT(len);
++		break;
++	case LINUX_HIDIOCGINPUT:
++		args->cmd = HIDIOCGINPUT(len);
++		break;
++	case LINUX_HIDIOCSOUTPUT:
++		args->cmd = HIDIOCSOUTPUT(len);
++		break;
++	case LINUX_HIDIOCGOUTPUT:
++		args->cmd = HIDIOCGOUTPUT(len);
++		break;
++	}
++
++	return (sys_ioctl(td, (struct ioctl_args *)args));
++}
++
+ /*
+  * main ioctl syscall function
+  */
+diff --git sys/compat/linux/linux_ioctl.h sys/compat/linux/linux_ioctl.h
+index 8345b7e4b7196e..2dd423127f94e2 100644
+--- sys/compat/linux/linux_ioctl.h
++++ sys/compat/linux/linux_ioctl.h
+@@ -796,6 +796,25 @@
+ #define LINUX_IOCTL_NVME_MIN	LINUX_NVME_IOCTL_ID
+ #define LINUX_IOCTL_NVME_MAX	LINUX_NVME_IOCTL_RESCAN
+ 
++/*
++ * hidraw
++ */
++#define LINUX_HIDIOCGRDESCSIZE	0x4801
++#define LINUX_HIDIOCGRDESC	0x4802
++#define LINUX_HIDIOCGRAWINFO	0x4803
++#define LINUX_HIDIOCGRAWNAME	0x4804
++#define LINUX_HIDIOCGRAWPHYS	0x4805
++#define LINUX_HIDIOCSFEATURE	0x4806
++#define LINUX_HIDIOCGFEATURE	0x4807
++#define LINUX_HIDIOCGRAWUNIQ	0x4808
++#define LINUX_HIDIOCSINPUT	0x4809
++#define LINUX_HIDIOCGINPUT	0x480A
++#define LINUX_HIDIOCSOUTPUT	0x480B
++#define LINUX_HIDIOCGOUTPUT	0x480C
++
++#define LINUX_IOCTL_HIDRAW_MIN	LINUX_HIDIOCGRDESCSIZE
++#define LINUX_IOCTL_HIDRAW_MAX	LINUX_HIDIOCGOUTPUT
++
+ /*
+  * Pluggable ioctl handlers
+  */
