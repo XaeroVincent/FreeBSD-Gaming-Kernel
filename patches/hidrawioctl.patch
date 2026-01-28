@@ -18,7 +18,7 @@ index ceb17bd040b551..cb4893d041a1e7 100644
  
  #include <dev/evdev/input.h>
 +#include <dev/hid/hidraw.h>
- #include <dev/ususb_ioctl.h>
+ #include <dev/usb/usb_ioctl.h>
  
  #ifdef COMPAT_LINUX32
 @@ -113,6 +114,7 @@ DEFINE_LINUX_IOCTL_SET(kcov, KCOV);
