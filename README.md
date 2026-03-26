@@ -2,7 +2,7 @@
 
 **AI Disclosure:** _AI agents were used to assist with development._
 
-* **Syscall User Dispatch** - to satify games with aggressive anti-tamper DRM, such as Denuvo
+* **Syscall User Dispatch** - to support games with aggressive anti-tamper DRM, such as Denuvo
 * **Linsysfs nodes** - to enable GPU accelerated Linux applications with Mesa graphics
 * **Hidraw ioctl handler** - to improve game controller support **(Currently Incomplete)**
 * **Ignore EPOLLEXCLUSIVE** - to paritally workaround games and apps that require EPOLLEXCLUSIVE
