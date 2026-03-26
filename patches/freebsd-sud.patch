@@ -1,0 +1,719 @@
+Syscall User Dispatch (SUD) for FreeBSD/amd64
+
+Allows a Wine process to register an allow-range VA window plus a
+userspace selector byte so that SYSCALL instructions whose RIP falls
+outside the allow-range are redirected as SIGSYS rather than executed.
+Wine registers its __wine_syscall_dispatcher thunk as the allow-range;
+Windows PE stubs that issue SYSCALL directly are intercepted and handled
+by Wine's signal handler, which translates the Windows syscall number
+and emulates the call. Equivalent to Linux PR_SET_SYSCALL_USER_DISPATCH
+(Linux 5.11).
+
+Design
+------
+- Per-thread struct sud_state is heap-allocated and hung off td->td_sud.
+  The asm hot-path does a single null-pointer test; no TDP_/TDP2_ flag
+  bit is consumed.  (All TDP_ bits 0x1..0x80000000 are currently used.)
+- td_sud is placed after td_ktr_io_lim, past the td_endcopy boundary,
+  so fork1()'s bcopy(td_startcopy..td_endcopy) does NOT copy it.
+  It is explicitly initialized to NULL in fork1() instead.
+- KBI: new field is appended after td_ktr_io_lim, past all four offsets
+  asserted by _Static_assert in kern_thread.c (td_flags@0x108,
+  td_pflags@0x114, td_frame@0x4e8, td_emuldata@0x6f0).  No assert change.
+- Selector is read with fubyte(9) in the C helper.  fubyte returns -1 on
+  page fault; we treat that as ALLOW (fail-open) so a bad selector pointer
+  does not permanently wedge the process.
+- Interrupts: fast_syscall_common already emits `sti` before our insertion
+  point (after handle_ibrs_entry, before saving the remaining GPRs).
+  Interrupts are therefore already enabled when the SUD hot-path runs.
+  The `sti` inside the SUD block is defensive documentation; it is a
+  no-op in the current code but makes the liveness of IF explicit to
+  future readers.  On the BLOCK path we jump to label 1: where the
+  existing `cli` re-disables interrupts before the PCB_FULL_IRET test.
+- SIGSYS is queued via trapsignal(9).  Delivery goes through the existing
+  AST path on sysretq exit (label 1: / userret() loop in
+  fast_syscall_common).  The helper must NOT call userret() itself.
+- SUD is self-only, matching Linux PR_SET_SYSCALL_USER_DISPATCH: PROC_SUD_SET
+  and PROC_SUD_CLEAR operate only on the calling thread (td == curthread).
+  This eliminates the cross-thread UAF race that would exist if td_sud were
+  written for a thread that is concurrently executing amd64_syscall_sud_check:
+  the hot-path loads td->td_sud without any lock, so a concurrent free() from
+  another thread would be a use-after-free.  With self-only semantics td_sud
+  is only ever written by td itself; since td is currently executing procctl(2)
+  it cannot simultaneously be in the hot-path.  Wine always calls
+  procctl(P_PID, getpid(), PROC_SUD_SET, ...) from the thread that needs
+  interception, matching this model exactly.
+  Both callbacks enforce self-only at the API boundary: if the procctl
+  framework resolves a target process other than td->td_proc the call is
+  rejected with EPERM.
+- fork/clone inheritance: SUD state is intentionally not inherited across
+  fork(2) or thread creation, matching the behavior of Linux
+  PR_SET_SYSCALL_USER_DISPATCH. Child processes and threads always start
+  with SUD disabled (td_sud = NULL) to prevent cross-thread memory sharing 
+  of the userspace selector pointer.
+- On exec(2): SUD is cleared in exec_onexec_old(), alongside
+  sigfastblock_clear().  exec_new_vmspace() sets vmspace_destroyed=true
+  before calling exec_onexec_old(), so the old VA range and selector
+  pointer are already gone when we free the state.
+- kern_thr.c: newtd->td_sud = NULL is set BEFORE initialize_thread() so
+  that the thread_free() error path in thread_create() is always safe.
+  td_sud lies past both td_endzero and td_endcopy; neither the bzero
+  nor bcopy in thread_create() touches it.  The UMA zone has no
+  UMA_ZONE_ZERO and thread_init/thread_ctor do not initialise td_sud.
+- MALLOC_DEFINE(M_SUD) lives in trap.c (where amd64_syscall_sud_check
+  lives).  All other TUs use MALLOC_DECLARE via sud.h.
+- trap.c already uses fubyte() (lines 635-642) so vm/vm_extern.h is
+  already pulled in; only <sys/malloc.h> and <sys/sud.h> are new.
+- The SIGSYS si_code is SIGSYS_DISPATCH=1.  The SYS_ prefix is avoided
+  because FreeBSD's <sys/syscall.h> already uses SYS_ for syscall numbers
+  (SYS_exit=1 etc.); a SYS_-prefixed si_code in <sys/signal.h> would sit in
+  the same namespace and cause confusion.  Linux uses SYS_USER_DISPATCH=2 with
+  the same semantic; SIGSYS_DISPATCH follows FreeBSD's per-signal prefix
+  convention (ILL_, FPE_, SEGV_, BUS_, ...) instead.
+  SIGSYS_DISPATCH=1 is placed after the SIGPOLL codes block, before the
+  closing #endif, so it sits in its own clearly labelled section and does
+  not appear visually nested inside the SIGILL block.
+- 32-bit compat (freebsd32): not implemented.  Wine on amd64 is 64-bit;
+  a freebsd32 thunk for proc_sud_ctl is left as future work.
+
+Files changed
+-------------
+  sys/sys/sud.h                  NEW
+  sys/sys/signal.h               add SIGSYS_DISPATCH si_code
+  sys/sys/proc.h                 add td_sud to struct thread
+  sys/sys/procctl.h              add PROC_SUD_SET / PROC_SUD_CLEAR
+  sys/amd64/amd64/genassym.c     add TD_SUD, SUD_START/LEN/SELECTOR
+  sys/amd64/amd64/exception.S    hot-path check in fast_syscall_common
+  sys/amd64/amd64/trap.c         MALLOC_DEFINE(M_SUD) + amd64_syscall_sud_check()
+  sys/kern/kern_thread.c         free td_sud in thread_free_batched();
+                                 add thread_sud_clear()
+  sys/kern/kern_fork.c           initialize td_sud to NULL after bcopy
+  sys/kern/kern_procctl.c        table entries + sud_set() + sud_clear();
+                                 add proc_sud_ctl to sys_procctl data union
+  sys/kern/kern_exec.c           clear td_sud in exec_onexec_old()
+  sys/kern/kern_thr.c            initialize td_sud to NULL in thread_create()
+  sys/amd64/amd64/exec_machdep.c clear the selector on signal delivery
+
+=============================================================================
+diff -ruN --show-c-function sys/amd64/amd64/exception.S sys/amd64/amd64/exception.S
+--- sys/amd64/amd64/exception.S	2026-03-20 13:39:51.104708000 -0700
++++ sys/amd64/amd64/exception.S	2026-03-20 14:14:59.020455000 -0700
+@@ -567,8 +567,71 @@ fast_syscall_common:
+ 	movq	%rsp,TD_FRAME(%rdi)
+ 	movl	TF_RFLAGS(%rsp),%esi
+ 	andl	$PSL_T,%esi
++
++	/*
++	 * Syscall User Dispatch (SUD) hot-path check.
++	 *
++	 * If td_sud is non-NULL and TF_RIP is outside the registered
++	 * allow-range [ss_start, ss_start+ss_len), call the C helper which
++	 * reads the userspace selector byte and optionally queues SIGSYS.
++	 *
++	 * Register state at this point:
++	 * %rdi  = curthread  (loaded four instructions above)
++	 * %esi  = PSL_T flag (must survive into amd64_syscall)
++	 * %r10  = caller-saved, already saved in trapframe; use as scratch
++	 * %r11  = caller-saved, already saved in trapframe; use as scratch
++	 *
++	 * Interrupt state:
++	 * fast_syscall_common emits `sti` earlier in the function, after
++	 * handle_ibrs_entry() and before saving the remaining GPRs.
++	 * Interrupts are therefore already ENABLED at this point.
++	 * The `sti` below is a no-op in the current code; it is kept as
++	 * explicit documentation that IF=1 is required before the call to
++	 * amd64_syscall_sud_check(), which calls fubyte(9), which may
++	 * page-fault (trap_pfault panics if called with IF=0). On the
++	 * BLOCK path we jump to label 1: where the existing `cli`
++	 * re-disables interrupts before the PCB_FULL_IRET test.
++	 *
++	 * Register saving:
++	 * The C ABI treats %rsi/%rdi as caller-saved; both are clobbered
++	 * by amd64_syscall_sud_check().  We re-derive them from the
++	 * trapframe on the ALLOW return path. %r10 is scratch for the
++	 * range check and is not needed afterward.
++	 */
++	movq	TD_SUD(%rdi),%r11		/* r11 = td_sud pointer */
++	testq	%r11,%r11
++	jz	.Lfast_syscall_sud_pass		/* NULL -> SUD disabled */
++
++	/* Unsigned range check: (TF_RIP - ss_start) < ss_len ? */
++	movq	TF_RIP(%rsp),%r10		/* saved user RIP */
++	subq	SUD_START(%r11),%r10		/* r10 = rip - start (unsigned) */
++	cmpq	SUD_LEN(%r11),%r10
++	jb	.Lfast_syscall_sud_pass		/* inside allow-range: proceed */
++
++	/*
++	 * RIP is outside the allow-range. IF is already 1 (see above).
++	 * The `sti` here is a no-op but documents the requirement explicitly.
++	 */
++	sti
++	movq	%rsp,%rdi			/* arg0: trapframe * */
++	call	amd64_syscall_sud_check
++	testl	%eax,%eax
++	jnz	.Lfast_syscall_sud_done		/* BLOCK: SIGSYS queued */
++
++	/*
++	 * ALLOW path: %rdi and %esi were clobbered by the C call.
++	 * Reload curthread and re-derive the PSL_T flag from the trapframe.
++	 * Interrupts remain enabled; amd64_syscall() expects that.
++	 */
++	movq	PCPU(CURTHREAD),%rdi
++	movl	TF_RFLAGS(%rsp),%esi
++	andl	$PSL_T,%esi
++
++.Lfast_syscall_sud_pass:
+ 	call	amd64_syscall
++.Lfast_syscall_sud_done:
+ 1:	movq	PCPU(CURPCB),%rax
++
+ 	/* Disable interrupts before testing PCB_FULL_IRET. */
+ 	cli
+ 	testl	$PCB_FULL_IRET,PCB_FLAGS(%rax)
+diff -ruN --show-c-function sys/amd64/amd64/exec_machdep.c sys/amd64/amd64/exec_machdep.c
+--- sys/amd64/amd64/exec_machdep.c	2026-03-20 13:39:51.104687000 -0700
++++ sys/amd64/amd64/exec_machdep.c	2026-03-20 18:51:02.497245000 -0700
+@@ -64,6 +64,7 @@
+ #include <sys/sysctl.h>
+ #include <sys/sysent.h>
+ #include <sys/sysproto.h>
++#include <sys/sud.h>
+ #include <sys/ucontext.h>
+ #include <sys/vmmeter.h>
+ 
+@@ -164,6 +165,16 @@ sendsig(sig_t catcher, ksiginfo_t *ksi, sigset_t *mask
+ 	/* Build the argument list for the signal handler. */
+ 	regs->tf_rdi = sig;			/* arg 1 in %rdi */
+ 	regs->tf_rdx = (register_t)&sfp->sf_uc;	/* arg 3 in %rdx */
++
++	/*
++	 * Syscall User Dispatch: clear the selector on signal delivery.
++	 * This matches Linux PR_SET_SYSCALL_USER_DISPATCH behavior and
++	 * prevents asynchronous signals (e.g., SIGSEGV, SIGALRM) from
++	 * triggering SUD interception while executing the signal handler.
++	 */
++	if (td->td_sud != NULL)
++		(void)subyte(td->td_sud->ss_selector, SYSCALL_DISPATCH_FILTER_ALLOW);
++
+ 	bzero(&sf.sf_si, sizeof(sf.sf_si));
+ 	if (SIGISMEMBER(psp->ps_siginfo, sig)) {
+ 		/* Signal handler installed with SA_SIGINFO. */
+diff -ruN --show-c-function sys/amd64/amd64/genassym.c sys/amd64/amd64/genassym.c
+--- sys/amd64/amd64/genassym.c	2026-03-20 13:39:51.104500000 -0700
++++ sys/amd64/amd64/genassym.c	2026-03-20 14:14:59.020610000 -0700
+@@ -39,6 +39,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/assym.h>
++#include <sys/sud.h>
+ #include <sys/bio.h>
+ #include <sys/buf.h>
+ #include <sys/proc.h>
+@@ -83,6 +84,13 @@ ASSYM(TD_FRAME, offsetof(struct thread, td_frame));
+ ASSYM(TD_PFLAGS, offsetof(struct thread, td_pflags));
+ ASSYM(TD_PROC, offsetof(struct thread, td_proc));
+ ASSYM(TD_FRAME, offsetof(struct thread, td_frame));
++
++ASSYM(TD_SUD, offsetof(struct thread, td_sud));
++
++ASSYM(SUD_START, offsetof(struct sud_state, ss_start));
++ASSYM(SUD_LEN, offsetof(struct sud_state, ss_len));
++ASSYM(SUD_SELECTOR, offsetof(struct sud_state, ss_selector));
++
+ ASSYM(TD_MD, offsetof(struct thread, td_md));
+ ASSYM(TD_MD_PCB, offsetof(struct thread, td_md.md_pcb));
+ ASSYM(TD_MD_STACK_BASE, offsetof(struct thread, td_md.md_stack_base));
+diff -ruN --show-c-function sys/amd64/amd64/trap.c sys/amd64/amd64/trap.c
+--- sys/amd64/amd64/trap.c	2026-03-20 13:39:51.104286000 -0700
++++ sys/amd64/amd64/trap.c	2026-03-20 19:16:44.071209000 -0700
+@@ -63,6 +63,8 @@
+ #include <sys/signalvar.h>
+ #include <sys/syscall.h>
+ #include <sys/sysctl.h>
++#include <sys/malloc.h>
++#include <sys/sud.h>
+ #include <sys/sysent.h>
+ #include <sys/uio.h>
+ #include <sys/vmmeter.h>
+@@ -111,6 +113,8 @@ static bool trap_user_dtrace(struct trapframe *,
+     int (**hook)(struct trapframe *));
+ #endif
+ 
++MALLOC_DEFINE(M_SUD, "sud", "Syscall User Dispatch state");
++
+ static const char UNKNOWN[] = "unknown";
+ static const char *const trap_msg[] = {
+ 	[0] =			UNKNOWN,			/* unused */
+@@ -1245,4 +1249,67 @@ amd64_syscall(struct thread *td, int traced)
+ 		set_pcb_flags(td->td_pcb, PCB_FULL_IRET);
+ 
+ 	amd64_syscall_ret_flush_l1d_check_inline(td->td_errno);
++}
++
++/*
++ * amd64_syscall_sud_check(frame)
++ *
++ * Called from fast_syscall_common (exception.S) when td_sud != NULL and
++ * TF_RIP is outside the registered allow-range.
++ *
++ * Interrupts are ENABLED on entry: fast_syscall_common emits `sti` before
++ * our insertion point, so fubyte(9) can safely take a page fault if the
++ * selector byte is paged out.
++ *
++ * Reads *ss_selector via fubyte(9): safe single-byte userspace fetch
++ * with automatic page-fault handling. Returns the byte value (0-255)
++ * or -1 on fault. We treat -1 as ALLOW (fail-open) so that a process
++ * with a transiently unmapped selector page is not permanently wedged.
++ *
++ * On BLOCK (selector == SYSCALL_DISPATCH_FILTER_BLOCK):
++ * - The Windows syscall number currently in tf_rax is saved into
++ * ksi_syscall before tf_rax is overwritten with ENOSYS, so Wine's
++ * SIGSYS handler can identify and emulate the call.
++ * - Returns 1; caller (exception.S) skips amd64_syscall().
++ * SIGSYS delivery happens via the normal AST / userret() path.
++ *
++ * On ALLOW or fault: returns 0; caller proceeds to amd64_syscall().
++ */
++int
++amd64_syscall_sud_check(struct trapframe *frame)
++{
++	struct thread *td;
++	struct sud_state *ss;
++	ksiginfo_t ksi;
++	int sel;
++
++	td = curthread;
++	ss = td->td_sud;
++	if (ss == NULL)
++		return (0);
++
++	/* Exempt libthr signal trampoline syscalls so threads can exit
++	 * signal handlers safely without deadlocking inside SUD.
++	 */
++	if (frame->tf_rax == SYS_sigreturn || frame->tf_rax == SYS_sigfastblock)
++		return (0);
++
++	sel = fubyte(ss->ss_selector);
++	if (sel != SYSCALL_DISPATCH_FILTER_BLOCK)
++		return (0);		/* ALLOW or page fault -> proceed */
++
++	/*
++	 * BLOCK: capture the Windows syscall number before overwriting
++	 * tf_rax, so Wine's SIGSYS handler sees it in si_syscall.
++	 */
++	ksiginfo_init(&ksi);
++	ksi.ksi_signo   = SIGSYS;
++	ksi.ksi_code    = SIGSYS_DISPATCH;
++	ksi.ksi_info.si_syscall = (int)frame->tf_rax;
++	ksi.ksi_addr    = (void *)frame->tf_rip;
++
++	frame->tf_rax   = ENOSYS;
++
++	trapsignal(td, &ksi);
++	return (1);
+ }
+diff -ruN --show-c-function sys/kern/kern_exec.c sys/kern/kern_exec.c
+--- sys/kern/kern_exec.c	2026-03-20 13:39:51.134895000 -0700
++++ sys/kern/kern_exec.c	2026-03-20 14:14:59.021206000 -0700
+@@ -56,6 +56,7 @@
+ #include <sys/proc.h>
+ #include <sys/ptrace.h>
+ #include <sys/reg.h>
++#include <sys/sud.h>
+ #include <sys/resourcevar.h>
+ #include <sys/rwlock.h>
+ #include <sys/sched.h>
+@@ -1119,6 +1120,14 @@ exec_onexec_old(struct thread *td)
+ exec_onexec_old(struct thread *td)
+ {
+ 	sigfastblock_clear(td);
++	/*
++	 * Clear SUD.  exec_new_vmspace() sets imgp->vmspace_destroyed = true
++	 * before calling us, so the old address space is already gone: the
++	 * registered allow-range VAs and the selector pointer are invalid
++	 * for the new image. The new image must call PROC_SUD_SET again if
++	 * it wants SUD enabled.
++	 */
++	thread_sud_clear(td);
+ 	umtx_exec(td->td_proc);
+ }
+ 
+diff -ruN --show-c-function sys/kern/kern_fork.c sys/kern/kern_fork.c
+--- sys/kern/kern_fork.c	2026-03-20 13:39:51.137709000 -0700
++++ sys/kern/kern_fork.c	2026-03-20 14:14:59.021452000 -0700
+@@ -55,6 +55,7 @@
+ #include <sys/mutex.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
++#include <sys/sud.h>
+ #include <sys/procdesc.h>
+ #include <sys/ptrace.h>
+ #include <sys/racct.h>
+@@ -463,6 +464,12 @@ do_fork(struct thread *td, struct fork_req *fr, struct
+ 
+ 	bcopy(&td->td_startcopy, &td2->td_startcopy,
+ 	    __rangeof(struct thread, td_startcopy, td_endcopy));
++
++	/*
++	 * td_sud is beyond td_endcopy so the bcopy above did not copy it.
++	 * SUD state is intentionally not inherited across fork(2).
++	 * td2->td_sud remains NULL as initialized by thread_ctor().
++	 */
+ 
+ 	bcopy(&p2->p_comm, &td2->td_name, sizeof(td2->td_name));
+ 	td2->td_sigstk = td->td_sigstk;
+diff -ruN --show-c-function sys/kern/kern_procctl.c sys/kern/kern_procctl.c
+--- sys/kern/kern_procctl.c	2026-03-20 13:39:51.139593000 -0700
++++ sys/kern/kern_procctl.c	2026-03-20 14:14:59.021724000 -0700
+@@ -40,6 +40,7 @@
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+ #include <sys/procctl.h>
++#include <sys/sud.h>
+ #include <sys/sx.h>
+ #include <sys/syscallsubr.h>
+ #include <sys/sysproto.h>
+@@ -985,6 +986,9 @@ logsigexit_status(struct thread *td, struct proc *p, v
+ 	return (0);
+ }
+ 
++static int sud_set(struct thread *td, struct proc *p, void *data);
++static int sud_clear(struct thread *td, struct proc *p, void *data);
++
+ enum {
+ 	PCTL_SLOCKED,
+ 	PCTL_XLOCKED,
+@@ -1152,6 +1156,18 @@ static const struct procctl_cmd_info procctl_cmds_info
+ 	      .need_candebug = false,
+ 	      .copyin_sz = 0, .copyout_sz = sizeof(int),
+ 	      .exec = logsigexit_status, .copyout_on_error = false, },
++	[PROC_SUD_SET] =
++	    { .lock_tree = PCTL_UNLOCKED, .one_proc = true,
++	      .esrch_is_einval = false, .no_nonnull_data = false,
++	      .need_candebug = false,
++	      .copyin_sz = sizeof(struct proc_sud_ctl), .copyout_sz = 0,
++	      .exec = sud_set, .copyout_on_error = false, },
++	[PROC_SUD_CLEAR] =
++	    { .lock_tree = PCTL_UNLOCKED, .one_proc = true,
++	      .esrch_is_einval = false, .no_nonnull_data = true,
++	      .need_candebug = false,
++	      .copyin_sz = 0, .copyout_sz = 0,
++	      .exec = sud_clear, .copyout_on_error = false, },
+ };
+ 
+ int
+@@ -1161,6 +1177,7 @@ sys_procctl(struct thread *td, struct procctl_args *ua
+ 		struct procctl_reaper_status rs;
+ 		struct procctl_reaper_pids rp;
+ 		struct procctl_reaper_kill rk;
++		struct proc_sud_ctl sud;
+ 		int flags;
+ 	} x;
+ 	const struct procctl_cmd_info *cmd_info;
+@@ -1191,6 +1208,95 @@ sys_procctl(struct thread *td, struct procctl_args *ua
+ 			error = error1;
+ 	}
+ 	return (error);
++}
++
++/*
++ * sud_set -- enable Syscall User Dispatch for the calling thread.
++ *
++ * data points to a struct proc_sud_ctl already copyin'd by sys_procctl()
++ * (copyin_sz = sizeof(struct proc_sud_ctl)).
++ *
++ * SUD is self-only (matching Linux PR_SET_SYSCALL_USER_DISPATCH): only
++ * the calling thread (td) is modified.  This avoids a use-after-free
++ * race: the hot-path in amd64_syscall_sud_check() reads td->td_sud
++ * without any lock, so concurrent cross-thread writes would be unsafe.
++ * With self-only semantics td is currently executing this syscall and
++ * therefore cannot simultaneously be in the hot-path.
++ *
++ * Callers must target their own process (p == td->td_proc). The
++ * procctl framework allows one_proc=true operations to name any
++ * accessible process; we reject cross-process calls with EPERM because
++ * the operation is inherently per-calling-thread and applying it to a
++ * foreign process's thread is not meaningful.
++ *
++ * The new sud_state is allocated before the old one is freed so that on
++ * ENOMEM the existing configuration is left intact. M_NOWAIT is used
++ * because PROC_LOCK is held; in practice the struct is 24 bytes and
++ * allocation failure here is implausible.
++ *
++ * p is PROC_LOCKed on entry and must remain so on return (procctl
++ * framework requirement). No thread_lock is needed: we are td, and td
++ * cannot be running on another CPU while executing this syscall.
++ */
++static int
++sud_set(struct thread *td, struct proc *p, void *data)
++{
++	const struct proc_sud_ctl *ctl;
++	struct sud_state *ss;
++
++	PROC_LOCK_ASSERT(p, MA_OWNED);
++
++	/* Self-only: reject cross-process calls. */
++	if (p != td->td_proc)
++		return (EPERM);
++
++	ctl = (const struct proc_sud_ctl *)data;
++
++	if (ctl->sud_len == 0)
++		return (EINVAL);
++	if (ctl->sud_start + ctl->sud_len < ctl->sud_start)	/* VA wrap */
++		return (EINVAL);
++	if (ctl->sud_selector == NULL)
++		return (EINVAL);
++
++	/*
++	 * Allocate the new state before touching td_sud so that on ENOMEM
++	 * the existing configuration remains intact.
++	 */
++	ss = malloc(sizeof(*ss), M_SUD, M_NOWAIT);
++	if (ss == NULL)
++		return (ENOMEM);
++
++	ss->ss_start    = ctl->sud_start;
++	ss->ss_len      = ctl->sud_len;
++	ss->ss_selector = ctl->sud_selector;
++
++	if (td->td_sud != NULL)
++		free(td->td_sud, M_SUD);
++	td->td_sud = ss;
++	return (0);
++}
++
++/*
++ * sud_clear -- disable Syscall User Dispatch for the calling thread.
++ *
++ * p is PROC_LOCKed on entry and must remain so on return.
++ * Self-only: rejects cross-process calls with EPERM for the same
++ * reasons as sud_set().
++ * thread_sud_clear() is safe here: td == curthread, so no concurrent
++ * hot-path execution is possible.
++ */
++static int
++sud_clear(struct thread *td, struct proc *p, void *data __unused)
++{
++	PROC_LOCK_ASSERT(p, MA_OWNED);
++
++	/* Self-only: reject cross-process calls. */
++	if (p != td->td_proc)
++		return (EPERM);
++
++	thread_sud_clear(td);
++	return (0);
+ }
+ 
+ static int
+diff -ruN --show-c-function sys/kern/kern_thr.c sys/kern/kern_thr.c
+--- sys/kern/kern_thr.c	2026-03-20 13:39:51.137214000 -0700
++++ sys/kern/kern_thr.c	2026-03-20 14:14:59.021905000 -0700
+@@ -39,6 +39,7 @@
+ #include <sys/lock.h>
+ #include <sys/mutex.h>
+ #include <sys/priv.h>
++#include <sys/sud.h>
+ #include <sys/proc.h>
+ #include <sys/posix4.h>
+ #include <sys/ptrace.h>
+@@ -263,6 +264,12 @@ thread_create(struct thread *td, struct rtprio *rtp,
+ 	}
+ 
+ 	PROC_LOCK(p);
++
++	/*
++	 * SUD state is intentionally not inherited by new threads.
++	 * newtd->td_sud remains NULL as initialized by thread_ctor().
++	 */
++
+ 	p->p_flag |= P_HADTHREADS;
+ 	thread_link(newtd, p);
+ 	bcopy(p->p_comm, newtd->td_name, sizeof(newtd->td_name));
+diff -ruN --show-c-function sys/kern/kern_thread.c sys/kern/kern_thread.c
+--- sys/kern/kern_thread.c	2026-03-20 13:39:51.139677000 -0700
++++ sys/kern/kern_thread.c	2026-03-20 14:14:59.022214000 -0700
+@@ -49,6 +49,7 @@
+ #include <sys/sleepqueue.h>
+ #include <sys/selinfo.h>
+ #include <sys/syscallsubr.h>
++#include <sys/sud.h>
+ #include <sys/dtrace_bsd.h>
+ #include <sys/sysent.h>
+ #include <sys/turnstile.h>
+@@ -390,6 +391,7 @@ thread_ctor(void *mem, int size, void *arg, int flags)
+ 	td = (struct thread *)mem;
+ 	TD_SET_STATE(td, TDS_INACTIVE);
+ 	td->td_lastcpu = td->td_oncpu = NOCPU;
++	td->td_sud = NULL;
+ 
+ 	/*
+ 	 * Note that td_critnest begins life as 1 because the thread is not
+@@ -838,6 +840,11 @@ thread_free_batched(struct thread *td)
+ 		vm_thread_dispose(td);
+ 	callout_drain(&td->td_slpcallout);
+ 	/*
++	 * Free SUD state.  Covers normal thread exit and any error path
++	 * that calls thread_free() before the thread ever ran.
++	 */
++	thread_sud_clear(td);
++	/*
+ 	 * Freeing handled by the caller.
+ 	 */
+ 	td->td_tid = -1;
+@@ -855,6 +862,25 @@ thread_free(struct thread *td)
+ 	thread_free_batched(td);
+ 	tid_free(tid);
+ 	thread_count_dec();
++}
++
++/*
++ * thread_sud_clear -- disable SUD for td and free its state.
++ *
++ * Safe when td_sud == NULL. Called from exec_onexec_old() to ensure
++ * the new image does not inherit the old SUD configuration, and from
++ * thread_free_batched() during normal thread teardown.
++ *
++ * The caller must ensure td is not concurrently running on another CPU
++ * (i.e. td == curthread, or the process is single-threaded for exec).
++ */
++void
++thread_sud_clear(struct thread *td)
++{
++	if (td->td_sud != NULL) {
++		free(td->td_sud, M_SUD);
++		td->td_sud = NULL;
++	}
+ }
+ 
+ void
+diff -ruN --show-c-function sys/sys/proc.h sys/sys/proc.h
+--- sys/sys/proc.h	2026-03-20 13:39:51.122272000 -0700
++++ sys/sys/proc.h	2026-03-20 14:14:59.022570000 -0700
+@@ -68,6 +68,7 @@
+ #include <sys/ucred.h>
+ #include <sys/types.h>
+ #include <sys/_domainset.h>
++#include <sys/sud.h>
+ 
+ #include <machine/proc.h>		/* Machine-dependent proc substruct. */
+ #ifdef _KERNEL
+@@ -389,6 +390,9 @@ struct thread {
+ 	int		td_pmcpend;
+ 	void		*td_remotereq;	/* (c) dbg remote request. */
+ 	off_t		td_ktr_io_lim;	/* (k) limit for ktrace file size */
++	struct sud_state *td_sud;	/* (k) SUD state; NULL = disabled.
++					 * Outside td_startcopy/td_endcopy;
++					 * Initialized to NULL in thread_ctor(). */
+ #ifdef EPOCH_TRACE
+ 	SLIST_HEAD(, epoch_tracker) td_epochs;
+ #endif
+diff -ruN --show-c-function sys/sys/procctl.h sys/sys/procctl.h
+--- sys/sys/procctl.h	2026-03-20 13:39:51.115052000 -0700
++++ sys/sys/procctl.h	2026-03-20 14:14:59.022718000 -0700
+@@ -68,6 +68,10 @@
+ #define	PROC_LOGSIGEXIT_CTL	23	/* en/dis logging on sigexit */
+ #define	PROC_LOGSIGEXIT_STATUS	24	/* query logging on sigexit */
+ 
++/* Syscall User Dispatch (self-only: applies to the calling thread) */
++#define	PROC_SUD_SET		25	/* enable SUD; arg struct proc_sud_ctl * */
++#define	PROC_SUD_CLEAR		26	/* disable SUD; arg must be NULL */
++
+ /* Operations for PROC_SPROTECT (passed in integer arg). */
+ #define	PPROT_OP(x)	((x) & 0xf)
+ #define	PPROT_SET	1
+diff -ruN --show-c-function sys/sys/signal.h sys/sys/signal.h
+--- sys/sys/signal.h	2026-03-20 13:39:51.116067000 -0700
++++ sys/sys/signal.h	2026-03-20 14:14:59.022896000 -0700
+@@ -343,6 +343,14 @@ struct __siginfo32 {
+ #define POLL_PRI	5	/* High priority input available	*/
+ #define POLL_HUP	6	/* Device disconnected			*/
+ 
++/* codes for SIGSYS */
++/*
++ * Note: the SYS_ prefix is reserved in FreeBSD for syscall numbers
++ * (<sys/syscall.h>); SIGSYS_ is used here to avoid that collision.
++ * Linux uses SYS_USER_DISPATCH=2 for the same concept.
++ */
++#define	SIGSYS_DISPATCH		1	/* syscall user dispatch */
++
+ #endif
+ 
+ #if __POSIX_VISIBLE || __XSI_VISIBLE
+diff -ruN --show-c-function sys/sys/sud.h sys/sys/sud.h
+--- sys/sys/sud.h	1969-12-31 16:00:00.000000000 -0800
++++ sys/sys/sud.h	2026-03-20 14:14:59.023035000 -0700
+@@ -0,0 +1,73 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 The FreeBSD Project
++ *
++ * Syscall User Dispatch (SUD).
++ */
++
++#ifndef _SYS_SUD_H_
++#define	_SYS_SUD_H_
++
++#include <sys/types.h>
++
++/*
++ * Selector byte values written by userspace to control dispatch.
++ * ALLOW (0): execute the syscall normally.
++ * BLOCK (1): deliver SIGSYS instead.
++ */
++#define	SYSCALL_DISPATCH_FILTER_ALLOW	0
++#define	SYSCALL_DISPATCH_FILTER_BLOCK	1
++
++/*
++ * Argument structure for procctl(2) PROC_SUD_SET.
++ */
++struct proc_sud_ctl {
++	uintptr_t	sud_start;	/* allow-range base VA (inclusive) */
++	size_t		sud_len;	/* allow-range length in bytes */
++	uint8_t		*sud_selector;	/* userspace selector byte pointer */
++};
++
++/*
++ * Per-thread kernel state. Hung off struct thread as td_sud.
++ * NULL means SUD is disabled for that thread.
++ *
++ * Field offsets exported to assembly via genassym.c:
++ * SUD_START    = offsetof(struct sud_state, ss_start)
++ * SUD_LEN      = offsetof(struct sud_state, ss_len)
++ * SUD_SELECTOR = offsetof(struct sud_state, ss_selector)
++ */
++struct sud_state {
++	uintptr_t	ss_start;	/* allow-range base VA */
++	size_t		ss_len;		/* allow-range length in bytes */
++	uint8_t		*ss_selector;	/* userspace selector byte pointer */
++};
++
++#ifdef _KERNEL
++
++#include <sys/malloc.h>
++
++struct thread;
++struct trapframe;
++
++MALLOC_DECLARE(M_SUD);
++
++/*
++ * Called from fast_syscall_common (exception.S) when td_sud != NULL and
++ * TF_RIP is outside the allow-range. Interrupts are ENABLED on entry
++ * (fast_syscall_common emits `sti` before our insertion point).
++ *
++ * Returns 0: proceed with amd64_syscall() (ALLOW or fubyte fault).
++ * Returns 1: SIGSYS queued; caller must skip amd64_syscall().
++ */
++int	amd64_syscall_sud_check(struct trapframe *frame);
++
++/*
++ * Disable SUD for td and free its state. Safe when td_sud == NULL.
++ * Called from exec path and thread teardown.
++ */
++void	thread_sud_clear(struct thread *td);
++
++#endif /* _KERNEL */
++
++#endif /* !_SYS_SUD_H_ */
