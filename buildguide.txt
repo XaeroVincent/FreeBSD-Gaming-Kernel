@@ -1,0 +1,3 @@
+sudo mkdir /tmp/repo
+sudo make -j $(nproc) kernel-toolchain
+sudo make buildkernel stage-packages-kernel create-packages-kernel REPODIR=/tmp/repo INSTKERNNAME=linsysfix KMODDIR=/boot/linsysfix KERNCONF=linsysfix ABI=FreeBSD:15:amd64
