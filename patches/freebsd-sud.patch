@@ -363,27 +363,27 @@ diff -ruN --show-c-function sys/kern/kern_fork.c sys/kern/kern_fork.c
  	bcopy(&p2->p_comm, &td2->td_name, sizeof(td2->td_name));
  	td2->td_sigstk = td->td_sigstk;
 diff -ruN --show-c-function sys/kern/kern_procctl.c sys/kern/kern_procctl.c
---- sys/kern/kern_procctl.c	2026-03-20 13:39:51.139593000 -0700
-+++ sys/kern/kern_procctl.c	2026-03-20 14:14:59.021724000 -0700
-@@ -40,6 +40,7 @@
- #include <sys/priv.h>
+--- sys/kern/kern_procctl.c	2026-07-31 03:45:53.831680000 -0700
++++ sys/kern/kern_procctl.c	2026-07-31 03:50:54.412555000 -0700
+@@ -41,6 +41,7 @@
  #include <sys/proc.h>
  #include <sys/procctl.h>
+ #include <sys/ptrace.h>
 +#include <sys/sud.h>
  #include <sys/sx.h>
  #include <sys/syscallsubr.h>
  #include <sys/sysproto.h>
-@@ -985,6 +986,9 @@ logsigexit_status(struct thread *td, struct proc *p, v
+@@ -970,6 +971,9 @@ logsigexit_status(struct thread *td, struct proc *p, v
+ 	*(int *)data = state;
  	return (0);
  }
- 
++
 +static int sud_set(struct thread *td, struct proc *p, void *data);
 +static int sud_clear(struct thread *td, struct proc *p, void *data);
-+
+ 
  enum {
  	PCTL_SLOCKED,
- 	PCTL_XLOCKED,
-@@ -1152,6 +1156,18 @@ static const struct procctl_cmd_info procctl_cmds_info
+@@ -1138,6 +1142,18 @@ static const struct procctl_cmd_info procctl_cmds_info
  	      .need_candebug = false,
  	      .copyin_sz = 0, .copyout_sz = sizeof(int),
  	      .exec = logsigexit_status, .copyout_on_error = false, },
@@ -402,7 +402,7 @@ diff -ruN --show-c-function sys/kern/kern_procctl.c sys/kern/kern_procctl.c
  };
  
  int
-@@ -1161,6 +1177,7 @@ sys_procctl(struct thread *td, struct procctl_args *ua
+@@ -1147,6 +1163,7 @@ sys_procctl(struct thread *td, struct procctl_args *ua
  		struct procctl_reaper_status rs;
  		struct procctl_reaper_pids rp;
  		struct procctl_reaper_kill rk;
@@ -410,7 +410,7 @@ diff -ruN --show-c-function sys/kern/kern_procctl.c sys/kern/kern_procctl.c
  		int flags;
  	} x;
  	const struct procctl_cmd_info *cmd_info;
-@@ -1191,6 +1208,95 @@ sys_procctl(struct thread *td, struct procctl_args *ua
+@@ -1177,9 +1194,98 @@ sys_procctl(struct thread *td, struct procctl_args *ua
  			error = error1;
  	}
  	return (error);
@@ -481,8 +481,8 @@ diff -ruN --show-c-function sys/kern/kern_procctl.c sys/kern/kern_procctl.c
 +		free(td->td_sud, M_SUD);
 +	td->td_sud = ss;
 +	return (0);
-+}
-+
+ }
+ 
 +/*
 + * sud_clear -- disable Syscall User Dispatch for the calling thread.
 + *
@@ -492,7 +492,7 @@ diff -ruN --show-c-function sys/kern/kern_procctl.c sys/kern/kern_procctl.c
 + * thread_sud_clear() is safe here: td == curthread, so no concurrent
 + * hot-path execution is possible.
 + */
-+static int
+ static int
 +sud_clear(struct thread *td, struct proc *p, void *data __unused)
 +{
 +	PROC_LOCK_ASSERT(p, MA_OWNED);
@@ -503,9 +503,13 @@ diff -ruN --show-c-function sys/kern/kern_procctl.c sys/kern/kern_procctl.c
 +
 +	thread_sud_clear(td);
 +	return (0);
- }
++}
++
++static int
+ kern_procctl_single(struct thread *td, struct proc *p, int com, void *data)
+ {
  
- static int
+
 diff -ruN --show-c-function sys/kern/kern_thr.c sys/kern/kern_thr.c
 --- sys/kern/kern_thr.c	2026-03-20 13:39:51.137214000 -0700
 +++ sys/kern/kern_thr.c	2026-03-20 14:14:59.021905000 -0700
