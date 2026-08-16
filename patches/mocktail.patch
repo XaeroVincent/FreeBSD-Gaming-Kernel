@@ -1,6 +1,6 @@
-diff --git a/sys/compat/linux/linux_stats.c b/sys/compat/linux/linux_stats.c
---- a/sys/compat/linux/linux_stats.c
-+++ b/sys/compat/linux/linux_stats.c
+diff --git sys/compat/linux/linux_stats.c sys/compat/linux/linux_stats.c
+--- sys/compat/linux/linux_stats.c
++++ sys/compat/linux/linux_stats.c
 @@ -308,6 +308,7 @@ bsd_to_linux_ftype(const char *fstypename)
  		{"nfs",      LINUX_NFS_SUPER_MAGIC},
  		{"ext2fs",   LINUX_EXT2_SUPER_MAGIC},
