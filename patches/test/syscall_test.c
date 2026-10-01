@@ -99,7 +99,7 @@ int main() {
     if (hRealProcess == NULL) {
         printf("\n[-] FATAL: OpenProcess failed (Error: %lu). Cannot run Stack Alignment tests.\n", GetLastError());
     } else {
-        if (sys_NtReadMem != (DWORD)-1) {
+/*      if (sys_NtReadMem != (DWORD)-1) {
             printf("\n[*] Testing NtReadVirtualMemory (Syscall 0x%04lX)...\n", sys_NtReadMem);
             NtReadVirtualMemory_t pNtReadMem = (NtReadVirtualMemory_t)CreateSyscallStub(sys_NtReadMem);
             
@@ -113,6 +113,26 @@ int main() {
             } else {
                 printf("    [-] FAILED: Returned NTSTATUS: 0x%08lX\n", status);
             }
+*/
+	if (sys_NtReadMem != (DWORD)-1) {
+            printf("\n[*] Testing NtReadVirtualMemory (Syscall 0x%04lX)...\n", sys_NtReadMem);
+            NtReadVirtualMemory_t pNtReadMem = (NtReadVirtualMemory_t)CreateSyscallStub(sys_NtReadMem);
+            
+            // ALLOCATE ON THE HEAP to bypass FreeBSD /proc/pid/mem stack cache-coherency limits
+            DWORD* pTargetVal = (DWORD*)VirtualAlloc(NULL, sizeof(DWORD), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            *pTargetVal = 0x1337BEEF;
+            
+            DWORD read_val = 0;
+            SIZE_T bytes_read = 0;
+            NTSTATUS status = pNtReadMem(hRealProcess, pTargetVal, &read_val, sizeof(DWORD), &bytes_read);
+
+            if (status == 0 && read_val == 0x1337BEEF) {
+                printf("    [+] STACK ALIGNMENT PASSED! 5th argument successfully resolved.\n");
+            } else {
+                printf("    [-] FAILED: Returned NTSTATUS: 0x%08lX, Read Val: 0x%08lX\n", status, read_val);
+            }
+            
+            VirtualFree(pTargetVal, 0, MEM_RELEASE);
         }
 
         if (sys_NtQIP != (DWORD)-1) {
