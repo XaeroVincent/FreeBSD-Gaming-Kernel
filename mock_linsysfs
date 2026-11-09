@@ -1,0 +1,41 @@
+#!/bin/sh
+
+# Note: Put this file in /usr/local/etc/rc.d
+# Usage: service mock_linsysfs enable/start/stop
+
+. /etc/rc.subr
+
+name="mock_linsysfs"
+rcvar="mock_linsysfs_enable"
+
+start_cmd="mock_linsysfs_start"
+stop_cmd="mock_linsysfs_stop"
+
+MOCK_DIR="/compat/linux/sys/dev/char"
+
+mock_linsysfs_start()
+{
+    echo "Setting up linsysfs mock overlay for dGPU..."
+    
+    # 1. Mount tmpfs over sysfs char dev directory if not already mounted
+    if ! mount | grep -q "on ${MOCK_DIR} "; then
+        mount -t tmpfs tmpfs "${MOCK_DIR}"
+    fi
+
+    # 2. Re-link card0 (dGPU)
+    ln -snf ../../class/drm/card0 "${MOCK_DIR}/226:0"
+
+    # 3. Map 226:128 to card0 (dGPU) so Linux apps land on the dGPU
+    ln -snf ../../class/drm/card0 "${MOCK_DIR}/226:128"
+}
+
+mock_linsysfs_stop()
+{
+    echo "Removing linsysfs mock overlay..."
+    if mount | grep -q "on ${MOCK_DIR} "; then
+        umount -f "${MOCK_DIR}"
+    fi
+}
+
+load_rc_config $name
+run_rc_command "$1"

@@ -1,0 +1,86 @@
+diff --git sys/compat/linux/linux_ioctl.h sys/compat/linux/linux_ioctl.h
+--- sys/compat/linux/linux_ioctl.h
++++ sys/compat/linux/linux_ioctl.h
+@@ -622,6 +622,26 @@
+ #define	LINUX_IOCTL_DRM_MIN	0x6400
+ #define	LINUX_IOCTL_DRM_MAX	0x64ff
+ 
++/*
++ * dma-buf
++ */
++#define	LINUX_DMA_BUF_IOCTL_SYNC		0x6200
++#define	LINUX_DMA_BUF_IOCTL_EXPORT_SYNC_FILE	0x6202
++#define	LINUX_DMA_BUF_IOCTL_IMPORT_SYNC_FILE	0x6203
++
++#define	LINUX_IOCTL_DMABUF_MIN	0x6200
++#define	LINUX_IOCTL_DMABUF_MAX	0x62ff
++
++/*
++ * sync_file
++ */
++#define	LINUX_SYNC_IOC_MERGE		0x3e03
++#define	LINUX_SYNC_IOC_FILE_INFO	0x3e04
++#define	LINUX_SYNC_IOC_SET_DEADLINE	0x3e05
++
++#define	LINUX_IOCTL_SYNCFILE_MIN	0x3e00
++#define	LINUX_IOCTL_SYNCFILE_MAX	0x3eff
++
+ /*
+  * video
+  */
+diff --git sys/compat/linux/linux_ioctl.c sys/compat/linux/linux_ioctl.c
+--- sys/compat/linux/linux_ioctl.c
++++ sys/compat/linux/linux_ioctl.c
+@@ -108,6 +108,8 @@
+ DEFINE_LINUX_IOCTL_SET(termio, TERMIO);
+ DEFINE_LINUX_IOCTL_SET(private, PRIVATE);
+ DEFINE_LINUX_IOCTL_SET(drm, DRM);
++DEFINE_LINUX_IOCTL_SET(dmabuf, DMABUF);
++DEFINE_LINUX_IOCTL_SET(syncfile, SYNCFILE);
+ DEFINE_LINUX_IOCTL_SET(sg, SG);
+ DEFINE_LINUX_IOCTL_SET(v4l, VIDEO);
+ DEFINE_LINUX_IOCTL_SET(v4l2, VIDEO2);
+@@ -2579,6 +2581,42 @@
+ 	return (sys_ioctl(td, (struct ioctl_args *)args));
+ }
+ 
++/*
++ * dma-buf ioctl handler (drm-kmod)
++ */
++static int
++linux_ioctl_dmabuf(struct thread *td, struct linux_ioctl_args *args)
++{
++
++	switch (args->cmd & 0xffff) {
++	case LINUX_DMA_BUF_IOCTL_SYNC:
++	case LINUX_DMA_BUF_IOCTL_EXPORT_SYNC_FILE:
++	case LINUX_DMA_BUF_IOCTL_IMPORT_SYNC_FILE:
++		args->cmd = SETDIR(args->cmd);
++		return (sys_ioctl(td, (struct ioctl_args *)args));
++	}
++
++	return (ENOIOCTL);
++}
++
++/*
++ * sync_file ioctl handler (drm-kmod)
++ */
++static int
++linux_ioctl_syncfile(struct thread *td, struct linux_ioctl_args *args)
++{
++
++	switch (args->cmd & 0xffff) {
++	case LINUX_SYNC_IOC_MERGE:
++	case LINUX_SYNC_IOC_FILE_INFO:
++	case LINUX_SYNC_IOC_SET_DEADLINE:
++		args->cmd = SETDIR(args->cmd);
++		return (sys_ioctl(td, (struct ioctl_args *)args));
++	}
++
++	return (ENOIOCTL);
++}
++
+ #ifdef COMPAT_LINUX32
+ static int
+ linux_ioctl_sg_io(struct thread *td, struct linux_ioctl_args *args)
+

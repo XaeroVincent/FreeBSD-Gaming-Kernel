@@ -4,7 +4,8 @@
 
 * **Hidraw ioctl handler** - to improve game controller support **(Currently Incomplete)**
 * **Ignore EPOLLEXCLUSIVE** - to paritally workaround games and apps that require EPOLLEXCLUSIVE
-* **Linsysfs nodes** - to enable GPU accelerated Linux applications with Mesa graphics
+* **Linsysfs nodes** - to enable GPU accelerated Linux applications with Mesa graphics drivers
+* **Linux ioctl handlers** - to fix GPU accelerated Linux Vulkan with Mesa graphics drivers
 * **Mocktail** - to support the Mocktail Android compatibility runtime for the game Roblox
 * **Syscall User Dispatch** - to support games with aggressive anti-tamper DRM, such as Denuvo
 
